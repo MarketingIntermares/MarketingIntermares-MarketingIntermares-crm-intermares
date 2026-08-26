@@ -27,6 +27,56 @@ INICIADO_RE = re.compile(r"Atendimento iniciado pel[oa] ([^\n]+?) em (\d{2}/\d{2
 ANUNCIO_RE = re.compile(r"Anúncio:\s*([^\n]+)\nID:\s*(\d+)")
 RESOLVIDO_RE = re.compile(r"marcou o atendimento como resolvido em (\d{2}/\d{2}/\d{4}) (\d{2}:\d{2})")
 
+# frases em 1a pessoa que o CLIENTE usa pra dizer de onde veio -- mais preciso
+# que so procurar a palavra solta (que tambem aparece no pitch do vendedor,
+# tipo "segue a gente no instagram"). Mesma logica ja validada no CSV
+# mapeamento_origem_agosto_final.csv.
+ORIGIN_PHRASES = [
+    ("instagram", re.compile(r"\b(vi|achei|encontrei|vim|caiu|apareceu).{0,15}\binstagram\b", re.IGNORECASE)),
+    ("instagram", re.compile(r"\binstagram.{0,20}\b(anúncio|an[uú]ncio|propaganda)\b", re.IGNORECASE)),
+    ("facebook", re.compile(r"\b(vi|achei|encontrei|vim|caiu|apareceu).{0,15}\bface(book)?\b", re.IGNORECASE)),
+    ("google", re.compile(r"\b(vi|achei|encontrei|vim|pesquisei).{0,15}\bgoogle\b", re.IGNORECASE)),
+    ("anuncio_generico", re.compile(r"\b(vi|clique[i]?|cliquei).{0,10}\b(no |o )?an[uú]ncio\b", re.IGNORECASE)),
+    ("indicacao", re.compile(r"\bme indicou\b|\bnos indicou\b|\bamig[ao] (minha |meu )?indicou\b", re.IGNORECASE)),
+    ("indicacao", re.compile(r"indica(ç|c)[aã]o de [A-ZÀ-Ú][a-zà-ú]+")),
+]
+
+COMPATIBLE_TAG_SUBSTR = {
+    "instagram": ["instagram", "meta"],
+    "facebook": ["facebook", "meta"],
+    "google": ["google"],
+    "anuncio_generico": ["meta", "google", "ads"],
+    "indicacao": ["indica"],
+}
+
+SEARCH_WINDOW = 700
+
+
+def detect_origin_conflict(conversation_text: str, tag_ori: str) -> dict | None:
+    """
+    Compara a tag [ORI] do card com o que o cliente diz nos primeiros ~700
+    chars da conversa. Devolve None se nao ha pista textual (maioria dos
+    casos) ou {'status', 'categoria_sugerida', 'evidencia'} se ha.
+    """
+    window = (conversation_text or "")[:SEARCH_WINDOW]
+    for categoria, rx in ORIGIN_PHRASES:
+        m = rx.search(window)
+        if not m:
+            continue
+        start = max(0, m.start() - 40)
+        end = min(len(window), m.end() + 40)
+        evidencia = window[start:end].replace("\n", " ").strip()
+
+        compat = COMPATIBLE_TAG_SUBSTR.get(categoria, [])
+        tag_lower = (tag_ori or "").lower()
+        compativel = any(s in tag_lower for s in compat)
+
+        if tag_ori and compativel:
+            return None  # tag bate com o texto, sem conflito
+        status = "tag_diverge" if tag_ori else "sem_tag_com_sinal"
+        return {"status": status, "categoria_sugerida": categoria, "evidencia": evidencia}
+    return None
+
 
 def _to_iso_date(d: str) -> str | None:
     if not d:

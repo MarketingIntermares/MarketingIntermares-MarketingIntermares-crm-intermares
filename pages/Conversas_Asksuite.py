@@ -7,7 +7,7 @@ import psycopg
 import streamlit as st
 from streamlit_cookies_manager import EncryptedCookieManager
 
-from src.conversas_asksuite import CONVERSAS_TABLE
+from src.conversas_asksuite import CONVERSAS_TABLE, detect_origin_conflict
 from src.shared import APP_SECRET_KEY, DATABASE_URL, SESSIONS_TABLE, USERS_TABLE, db_query
 
 
@@ -43,11 +43,39 @@ def load_df() -> pd.DataFrame:
         return pd.read_sql(f"SELECT * FROM {CONVERSAS_TABLE}", con)
 
 
-df = load_df()
+df_all = load_df()
 
-if df.empty:
+if df_all.empty:
     st.warning("Nenhum dado carregado ainda nessa tabela.")
     st.stop()
+
+# data de referencia pra filtro: resolucao quando existe, senao 1a vez.
+# a maioria dos "aberto" nao tem data_resolucao ainda.
+df_all["data_referencia"] = pd.to_datetime(df_all["data_resolucao"]).fillna(
+    pd.to_datetime(df_all["data_primeira_vez"])
+)
+
+data_min = df_all["data_referencia"].min()
+data_max = df_all["data_referencia"].max()
+
+with st.container(border=True):
+    st.caption("Período (hoje só temos agosto/2026 — o filtro fica pronto pra quando tivermos mais meses)")
+    intervalo = st.date_input(
+        "Intervalo de datas",
+        value=(data_min.date(), data_max.date()) if pd.notna(data_min) and pd.notna(data_max) else None,
+        min_value=data_min.date() if pd.notna(data_min) else None,
+        max_value=data_max.date() if pd.notna(data_max) else None,
+        label_visibility="collapsed",
+    )
+
+if isinstance(intervalo, tuple) and len(intervalo) == 2:
+    inicio, fim = intervalo
+    mask = df_all["data_referencia"].dt.date.between(inicio, fim) | df_all["data_referencia"].isna()
+    df = df_all[mask].copy()
+else:
+    df = df_all.copy()
+
+st.caption(f"{len(df)} de {len(df_all)} conversas no período selecionado.")
 
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Total de conversas", len(df))
@@ -57,8 +85,8 @@ col4.metric("Sem origem identificável", int((df["origem_atual"] == "não identi
 
 st.divider()
 
-tab_vendedores, tab_origem, tab_gaps, tab_dados = st.tabs(
-    ["Vendedores", "Origem", "Gaps de identificação", "Dados brutos"]
+tab_vendedores, tab_origem, tab_etiquetas, tab_gaps, tab_dados = st.tabs(
+    ["Vendedores", "Origem", "Etiquetas", "Gaps de identificação", "Dados brutos"]
 )
 
 with tab_vendedores:
@@ -113,6 +141,50 @@ with tab_origem:
             .head(50),
             width="stretch", hide_index=True,
         )
+
+with tab_etiquetas:
+    st.subheader("Etiquetas [ORI] e [CAM]")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.caption("Distribuição [ORI] (origem)")
+        ori_counts = df[df["tag_ori_original"] != ""]["tag_ori_original"].value_counts().reset_index()
+        ori_counts.columns = ["Tag [ORI]", "Quantidade"]
+        st.dataframe(ori_counts.head(15), width="stretch", hide_index=True)
+    with c2:
+        st.caption("Distribuição [CAM] (campanha)")
+        cam_counts = df[df["tag_cam_original"] != ""]["tag_cam_original"].value_counts().reset_index()
+        cam_counts.columns = ["Tag [CAM]", "Quantidade"]
+        st.dataframe(cam_counts.head(15), width="stretch", hide_index=True)
+
+    st.divider()
+    st.subheader("Conflitos: tag do card vs. o que o cliente diz no texto")
+    st.caption(
+        "Só sinaliza quando o cliente menciona a origem explicitamente nos primeiros ~700 caracteres "
+        "da conversa. A maioria dos casos não tem essa pista — não significa que a tag está errada, "
+        "só que não dá pra confirmar nem contestar pelo texto."
+    )
+
+    if st.button("Rodar detecção de conflitos (pode levar alguns segundos)"):
+        conflitos = []
+        for _, row in df.iterrows():
+            resultado = detect_origin_conflict(row["conversation_text"], row["tag_ori_original"])
+            if resultado:
+                conflitos.append({
+                    "Contato": row["contato"],
+                    "Vendedor": row["vendedor"],
+                    "Tag atual": row["tag_ori_original"] or "(ausente)",
+                    "Texto sugere": resultado["categoria_sugerida"],
+                    "Status": "Tag pode estar errada" if resultado["status"] == "tag_diverge" else "Sem tag, texto sugere uma",
+                    "Evidência": resultado["evidencia"],
+                })
+        st.session_state["conflitos_tag"] = conflitos
+
+    conflitos = st.session_state.get("conflitos_tag")
+    if conflitos is not None:
+        st.metric("Conflitos encontrados", len(conflitos))
+        if conflitos:
+            st.dataframe(pd.DataFrame(conflitos), width="stretch", hide_index=True)
 
 with tab_gaps:
     st.subheader("Conversas sem vendedor nem origem identificados")
