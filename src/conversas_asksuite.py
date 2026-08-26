@@ -26,6 +26,69 @@ PERDEU_TAG_RE = re.compile(r"Perdeu-?\s*([^\[\]]*?)(?=\s{2,}|\[|$)")
 INICIADO_RE = re.compile(r"Atendimento iniciado pel[oa] ([^\n]+?) em (\d{2}/\d{2}/\d{4}) (\d{2}:\d{2})")
 ANUNCIO_RE = re.compile(r"Anúncio:\s*([^\n]+)\nID:\s*(\d+)")
 RESOLVIDO_RE = re.compile(r"marcou o atendimento como resolvido em (\d{2}/\d{2}/\d{4}) (\d{2}:\d{2})")
+ATRIBUIDO_RE = re.compile(r"[Aa]tendimento atribuíd[oa] (?:automaticamente )?para ([^\n]+?) em (\d{2}/\d{2}/\d{4}) (\d{2}:\d{2})")
+ROBO_PARADO_RE = re.compile(r"O robô foi parado por ([^\n]+?) em (\d{2}/\d{2}/\d{4}) (\d{2}:\d{2})")
+RESOLVIDO_QUEM_RE = re.compile(r"([^\n]+?) marcou o atendimento como resolvido em (\d{2}/\d{2}/\d{4}) (\d{2}:\d{2})")
+ANTERIOR_COLAPSADO_RE = re.compile(r"Carregar o atendimento anterior realizado em (\d{2}/\d{2}/\d{4}) (\d{2}:\d{2})")
+
+
+def extract_timeline_events(conversation_text: str, card_raw_text: str = "") -> list[dict]:
+    """
+    Extrai os marcos estruturados da conversa (nao o texto livre das
+    mensagens) em ordem cronologica -- pra montar a linha do tempo por
+    cliente. So usa marcadores que o proprio Asksuite gera (data/hora
+    reais), nao tenta resumir o que foi dito.
+    """
+    text = conversation_text or ""
+    eventos = []
+
+    for m in INICIADO_RE.finditer(text):
+        eventos.append({"data": m.group(2), "hora": m.group(3), "tipo": "Atendimento iniciado", "detalhe": m.group(1).strip()})
+
+    for m in ATRIBUIDO_RE.finditer(text):
+        eventos.append({"data": m.group(2), "hora": m.group(3), "tipo": "Atribuído a vendedor", "detalhe": m.group(1).strip()})
+
+    for m in ROBO_PARADO_RE.finditer(text):
+        eventos.append({"data": m.group(2), "hora": m.group(3), "tipo": "Vendedor assumiu (robô parado)", "detalhe": m.group(1).strip()})
+
+    for m in RESOLVIDO_QUEM_RE.finditer(text):
+        quem = m.group(1).strip().split("\n")[-1]  # pega so a ultima linha antes do "marcou..."
+        eventos.append({"data": m.group(2), "hora": m.group(3), "tipo": "Marcado como resolvido", "detalhe": quem})
+
+    for m in ANTERIOR_COLAPSADO_RE.finditer(text):
+        eventos.append({"data": m.group(1), "hora": m.group(2), "tipo": "Atendimento anterior (expandido)", "detalhe": ""})
+
+    m_anuncio = ANUNCIO_RE.search(text)
+    if m_anuncio and eventos:
+        # associa o anuncio ao primeiro "Atendimento iniciado" (mesmo atendimento)
+        primeiro_inicio = min(
+            (e for e in eventos if e["tipo"] == "Atendimento iniciado"),
+            key=lambda e: (e["data"], e["hora"]), default=None,
+        )
+        if primeiro_inicio:
+            eventos.append({
+                "data": primeiro_inicio["data"], "hora": primeiro_inicio["hora"],
+                "tipo": "Origem: anúncio", "detalhe": m_anuncio.group(1).strip(),
+            })
+
+    m_perdeu = PERDEU_TAG_RE.search(card_raw_text or "")
+    if m_perdeu and eventos:
+        ultimo_resolvido = max(
+            (e for e in eventos if e["tipo"] == "Marcado como resolvido"),
+            key=lambda e: (e["data"], e["hora"]), default=None,
+        )
+        if ultimo_resolvido:
+            eventos.append({
+                "data": ultimo_resolvido["data"], "hora": ultimo_resolvido["hora"],
+                "tipo": "Motivo da perda", "detalhe": m_perdeu.group(1).strip() or "(sem motivo especificado)",
+            })
+
+    def _key(e):
+        dd, mm, yy = e["data"].split("/")
+        return (yy, mm, dd, e["hora"])
+
+    eventos.sort(key=_key)
+    return eventos
 
 # frases em 1a pessoa que o CLIENTE usa pra dizer de onde veio -- mais preciso
 # que so procurar a palavra solta (que tambem aparece no pitch do vendedor,
@@ -88,7 +151,7 @@ def _to_iso_date(d: str) -> str | None:
 def _extrair_nome_contato(card_raw_text: str) -> str:
     texto = re.sub(r"^(chat_bubble(_outline)?|check_circle_outline)\s*", "", card_raw_text)
     texto = re.sub(
-        r"^(ABERTO|RESOLVIDO)?\s*(schedule(\d+[hm]\s*)+)?\s*(\d{1,2}(:\d{2}|/\d{2}/\d{2}))?\s*",
+        r"^(ABERTO|RESOLVIDO)?\s*(schedule(\d+[hms]\s*)+)?\s*(\d{1,2}(:\d{2}|/\d{2}/\d{2}))?\s*",
         "", texto,
     )
     texto = re.sub(r"^\d+\s+", "", texto)

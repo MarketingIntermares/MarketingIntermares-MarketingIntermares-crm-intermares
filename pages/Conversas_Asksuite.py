@@ -7,7 +7,7 @@ import psycopg
 import streamlit as st
 from streamlit_cookies_manager import EncryptedCookieManager
 
-from src.conversas_asksuite import CONVERSAS_TABLE, detect_origin_conflict
+from src.conversas_asksuite import CONVERSAS_TABLE, detect_origin_conflict, extract_timeline_events
 from src.shared import APP_SECRET_KEY, DATABASE_URL, SESSIONS_TABLE, USERS_TABLE, db_query
 
 
@@ -85,8 +85,8 @@ col4.metric("Sem origem identificável", int((df["origem_atual"] == "não identi
 
 st.divider()
 
-tab_vendedores, tab_origem, tab_etiquetas, tab_gaps, tab_dados = st.tabs(
-    ["Vendedores", "Origem", "Etiquetas", "Gaps de identificação", "Dados brutos"]
+tab_vendedores, tab_origem, tab_etiquetas, tab_conversao, tab_gaps, tab_dados = st.tabs(
+    ["Vendedores", "Origem", "Etiquetas", "Conversão", "Gaps de identificação", "Dados brutos"]
 )
 
 with tab_vendedores:
@@ -186,6 +186,53 @@ with tab_etiquetas:
         if conflitos:
             st.dataframe(pd.DataFrame(conflitos), width="stretch", hide_index=True)
 
+with tab_conversao:
+    st.subheader("Tempo até conversão (primeiro contato → ganhou)")
+    st.caption(
+        "Usa a data do primeiro contato de verdade (considerando histórico expandido, "
+        "mesmo que tenha sido anos atrás) até a data em que o atendimento foi marcado como ganho."
+    )
+
+    ganhos = df[
+        (df["esta_na_coluna_ganhou"]) &
+        (df["data_primeira_vez"].notna()) &
+        (df["data_resolucao"].notna())
+    ].copy()
+
+    if ganhos.empty:
+        st.info("Nenhuma conversão com as duas datas preenchidas no período selecionado.")
+    else:
+        ganhos["dias_ate_conversao"] = (
+            pd.to_datetime(ganhos["data_resolucao"]) - pd.to_datetime(ganhos["data_primeira_vez"])
+        ).dt.days
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Conversões analisadas", len(ganhos))
+        c2.metric("Média (dias)", f"{ganhos['dias_ate_conversao'].mean():.0f}")
+        c3.metric("Mediana (dias)", f"{ganhos['dias_ate_conversao'].median():.0f}")
+
+        faixas = [0, 1, 30, 60, 120, 365, 100000]
+        rotulos = ["Mesmo dia", "1–30 dias", "31–60 dias", "61–120 dias", "121–365 dias", "Mais de 1 ano"]
+        ganhos["faixa"] = pd.cut(ganhos["dias_ate_conversao"], bins=faixas, labels=rotulos, right=True, include_lowest=True)
+
+        faixa_counts = ganhos["faixa"].value_counts().reindex(rotulos).reset_index()
+        faixa_counts.columns = ["Faixa", "Quantidade"]
+        st.bar_chart(faixa_counts.set_index("Faixa"))
+        st.dataframe(faixa_counts, width="stretch", hide_index=True)
+
+        st.divider()
+        st.subheader("Conversões mais longas (clientes reativados depois de muito tempo)")
+        st.dataframe(
+            ganhos.sort_values("dias_ate_conversao", ascending=False)
+            [["contato", "vendedor", "origem_primeira_vez", "data_primeira_vez", "data_resolucao", "dias_ate_conversao"]]
+            .rename(columns={
+                "contato": "Contato", "vendedor": "Vendedor", "origem_primeira_vez": "Origem 1ª vez",
+                "data_primeira_vez": "1º contato", "data_resolucao": "Converteu em", "dias_ate_conversao": "Dias",
+            })
+            .head(20),
+            width="stretch", hide_index=True,
+        )
+
 with tab_gaps:
     st.subheader("Conversas sem vendedor nem origem identificados")
     sem_id = df[(df["vendedor"] == "") & (df["origem_atual"] == "não identificado")]
@@ -209,8 +256,28 @@ with tab_dados:
     if filtro_texto.strip():
         filtrado = filtrado[filtrado["contato"].str.contains(filtro_texto.strip(), case=False, na=False)]
 
-    st.dataframe(
+    filtrado = filtrado.reset_index(drop=True)
+    st.caption(f"{len(filtrado)} de {len(df)} registros. Clique numa linha pra ver a linha do tempo do cliente.")
+
+    selecao = st.dataframe(
         filtrado[["contato", "vendedor", "coluna", "origem_atual", "origem_primeira_vez", "data_resolucao"]],
         width="stretch", hide_index=True,
+        on_select="rerun", selection_mode="single-row",
     )
-    st.caption(f"{len(filtrado)} de {len(df)} registros.")
+
+    linhas_selecionadas = selecao.selection.rows if selecao and selecao.selection else []
+    if linhas_selecionadas:
+        cliente = filtrado.iloc[linhas_selecionadas[0]]
+        st.divider()
+        st.subheader(f"Linha do tempo — {cliente['contato']}")
+
+        eventos = extract_timeline_events(cliente["conversation_text"], cliente["card_raw_text"])
+        if not eventos:
+            st.info("Nenhum marco estruturado encontrado nessa conversa.")
+        else:
+            c1, c2 = st.columns(2)
+            c1.metric("Primeira interação", f"{eventos[0]['data']} {eventos[0]['hora']}")
+            c2.metric("Última interação", f"{eventos[-1]['data']} {eventos[-1]['hora']}")
+
+            for ev in eventos:
+                st.markdown(f"**{ev['data']} {ev['hora']}** — {ev['tipo']}" + (f": {ev['detalhe']}" if ev["detalhe"] else ""))
