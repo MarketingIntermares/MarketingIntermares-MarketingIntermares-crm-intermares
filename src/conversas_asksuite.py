@@ -141,6 +141,48 @@ def detect_origin_conflict(conversation_text: str, tag_ori: str) -> dict | None:
     return None
 
 
+# frases de rejeicao explicita do cliente -- heuristica por palavra-chave,
+# nao IA. Pode ter falso positivo/negativo, por isso mostra a evidencia
+# crua pra revisao humana em vez de tentar julgar sozinho.
+REJECTION_PHRASES = re.compile(
+    r"\bn[ãa]o,?\s*obrigad[ao]\b"
+    r"|\bn[ãa]o\s+quero\s+mais\b"
+    r"|\bn[ãa]o\s+tenho\s+interesse\b"
+    r"|\bn[ãa]o\s+vou\s+fechar\b"
+    r"|\bvou\s+desistir\b"
+    r"|\bdesisti\s+d[ae]\b"
+    r"|\bn[ãa]o\s+vai\s+dar\b"
+    r"|\bmudei\s+de\s+ideia\b"
+    r"|\bn[ãa]o\s+quero\s+mais\s+prosseguir\b",
+    re.IGNORECASE,
+)
+
+
+def detect_rejection_moment(conversation_text: str) -> dict | None:
+    """
+    Acha a PRIMEIRA frase de rejeicao explicita do cliente na conversa e
+    mostra o que veio depois dela (pra ver se o vendedor insistiu ou nao).
+    Nao atribui a fala a cliente/vendedor especificamente -- o texto e um
+    blob unico -- entao mostra a janela crua pra leitura humana.
+    """
+    text = conversation_text or ""
+    m = REJECTION_PHRASES.search(text)
+    if not m:
+        return None
+
+    antes_ini = max(0, m.start() - 60)
+    frase_cliente = text[antes_ini:m.end()].replace("\n", " ").strip()
+
+    depois = text[m.end():m.end() + 400].strip()
+    tem_resposta_depois = bool(depois.strip())
+
+    return {
+        "frase_rejeicao": frase_cliente,
+        "depois_da_rejeicao": depois.replace("\n", " ")[:250] if depois else "(nada depois — conversa parece ter parado aqui)",
+        "vendedor_respondeu_depois": tem_resposta_depois,
+    }
+
+
 def _to_iso_date(d: str) -> str | None:
     if not d:
         return None

@@ -7,7 +7,12 @@ import psycopg
 import streamlit as st
 from streamlit_cookies_manager import EncryptedCookieManager
 
-from src.conversas_asksuite import CONVERSAS_TABLE, detect_origin_conflict, extract_timeline_events
+from src.conversas_asksuite import (
+    CONVERSAS_TABLE,
+    detect_origin_conflict,
+    detect_rejection_moment,
+    extract_timeline_events,
+)
 from src.shared import APP_SECRET_KEY, DATABASE_URL, SESSIONS_TABLE, USERS_TABLE, db_query
 
 
@@ -117,6 +122,54 @@ with tab_vendedores:
             f"**{outlier['vendedor']}** está bem abaixo do resto do time "
             f"({outlier['pct_desfecho']}% de desfecho explícito vs. {resumo['pct_desfecho'].median():.0f}% mediano)."
         )
+
+    st.divider()
+    st.subheader("Em qual etapa cada vendedor perde mais")
+    st.caption("Coluna onde o card está parado nas conversas marcadas com etiqueta 'Perdeu-'.")
+    perdidos = vend[vend["tem_etiqueta_perdeu"]]
+    if not perdidos.empty:
+        pivot = pd.crosstab(perdidos["vendedor"], perdidos["coluna"])
+        st.dataframe(pivot, width="stretch")
+
+    st.divider()
+    st.subheader("Rejeição explícita do cliente — o vendedor insistiu depois?")
+    st.caption(
+        "Detecção por palavra-chave (não IA) de frases como 'não, obrigada', 'não tenho interesse', etc. "
+        "Pode ter falso positivo/negativo — sempre confira a evidência antes de usar pra avaliar alguém."
+    )
+    if st.button("Rodar detecção de rejeição"):
+        achados = []
+        for _, row in vend.iterrows():
+            r = detect_rejection_moment(row["conversation_text"])
+            if r:
+                achados.append({"vendedor": row["vendedor"], **r})
+        st.session_state["rejeicoes"] = achados
+
+    rejeicoes = st.session_state.get("rejeicoes")
+    if rejeicoes is not None:
+        if not rejeicoes:
+            st.info("Nenhuma frase de rejeição detectada no período selecionado.")
+        else:
+            rdf = pd.DataFrame(rejeicoes)
+            resumo_rej = rdf.groupby("vendedor").agg(
+                total_rejeicoes=("vendedor", "count"),
+                sem_resposta_depois=("vendedor_respondeu_depois", lambda s: (~s).sum()),
+            ).reset_index().sort_values("sem_resposta_depois", ascending=False)
+            st.dataframe(
+                resumo_rej.rename(columns={
+                    "vendedor": "Vendedor", "total_rejeicoes": "Rejeições detectadas",
+                    "sem_resposta_depois": "Conversa parou logo depois",
+                }),
+                width="stretch", hide_index=True,
+            )
+            with st.expander("Ver evidências individuais"):
+                st.dataframe(
+                    rdf.rename(columns={
+                        "vendedor": "Vendedor", "frase_rejeicao": "Frase da rejeição",
+                        "depois_da_rejeicao": "O que veio depois", "vendedor_respondeu_depois": "Teve algo depois",
+                    }),
+                    width="stretch", hide_index=True,
+                )
 
 with tab_origem:
     st.subheader("Origem dos contatos")
@@ -235,14 +288,29 @@ with tab_conversao:
 
 with tab_gaps:
     st.subheader("Conversas sem vendedor nem origem identificados")
-    sem_id = df[(df["vendedor"] == "") & (df["origem_atual"] == "não identificado")]
+    sem_id = df[(df["vendedor"] == "") & (df["origem_atual"] == "não identificado")].copy()
     st.metric("Total sem identificação", len(sem_id))
 
     if not sem_id.empty:
-        # canal aparece dentro do card_raw_text as vezes -- aqui so mostramos coluna/status
         por_coluna = sem_id["coluna"].value_counts().reset_index()
         por_coluna.columns = ["Coluna", "Quantidade"]
         st.dataframe(por_coluna, width="stretch", hide_index=True)
+
+        st.divider()
+        st.caption("Lista completa (clique numa coluna do cabeçalho pra ordenar).")
+        filtro_coluna_gap = st.selectbox(
+            "Filtrar por coluna", ["(todas)"] + sorted(sem_id["coluna"].unique())
+        )
+        gap_filtrado = sem_id if filtro_coluna_gap == "(todas)" else sem_id[sem_id["coluna"] == filtro_coluna_gap]
+        st.dataframe(
+            gap_filtrado[["contato", "coluna", "status_filtro", "data_primeira_vez"]]
+            .rename(columns={
+                "contato": "Contato", "coluna": "Coluna",
+                "status_filtro": "Status", "data_primeira_vez": "Data",
+            })
+            .sort_values("Data", na_position="last"),
+            width="stretch", hide_index=True,
+        )
 
 with tab_dados:
     st.subheader("Explorar dados brutos")
@@ -260,7 +328,13 @@ with tab_dados:
     st.caption(f"{len(filtrado)} de {len(df)} registros. Clique numa linha pra ver a linha do tempo do cliente.")
 
     selecao = st.dataframe(
-        filtrado[["contato", "vendedor", "coluna", "origem_atual", "origem_primeira_vez", "data_resolucao"]],
+        filtrado[[
+            "contato", "vendedor", "coluna", "origem_atual",
+            "data_primeira_vez", "data_resolucao",
+        ]].rename(columns={
+            "data_primeira_vez": "1ª interação",
+            "data_resolucao": "Última interação (se resolvido)",
+        }),
         width="stretch", hide_index=True,
         on_select="rerun", selection_mode="single-row",
     )
@@ -281,3 +355,10 @@ with tab_dados:
 
             for ev in eventos:
                 st.markdown(f"**{ev['data']} {ev['hora']}** — {ev['tipo']}" + (f": {ev['detalhe']}" if ev["detalhe"] else ""))
+
+        rejeicao = detect_rejection_moment(cliente["conversation_text"])
+        if rejeicao:
+            st.divider()
+            st.warning("Rejeição explícita detectada nessa conversa (revise antes de tirar conclusão):")
+            st.markdown(f"**Trecho:** ...{rejeicao['frase_rejeicao']}...")
+            st.markdown(f"**Depois:** {rejeicao['depois_da_rejeicao']}")
