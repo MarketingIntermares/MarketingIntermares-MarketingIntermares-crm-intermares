@@ -4,7 +4,6 @@ __pycache__/
 *.pyc
 .DS_Store
 .pytest_cache/
-data/
-*.db
-*.sqlite
-*.sqlite3
+crm_producao_original.py
+worker_producao_original.py
+/tmp/
