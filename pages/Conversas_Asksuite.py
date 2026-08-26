@@ -64,23 +64,41 @@ data_min = df_all["data_referencia"].min()
 data_max = df_all["data_referencia"].max()
 
 with st.container(border=True):
-    st.caption("Período (hoje só temos agosto/2026 — o filtro fica pronto pra quando tivermos mais meses)")
-    intervalo = st.date_input(
-        "Intervalo de datas",
-        value=(data_min.date(), data_max.date()) if pd.notna(data_min) and pd.notna(data_max) else None,
-        min_value=data_min.date() if pd.notna(data_min) else None,
-        max_value=data_max.date() if pd.notna(data_max) else None,
-        label_visibility="collapsed",
-    )
+    st.caption("Filtros (afetam todas as abas)")
+    f1, f2, f3, f4 = st.columns([2, 1, 1, 1])
+    with f1:
+        intervalo = st.date_input(
+            "Intervalo de datas",
+            value=(data_min.date(), data_max.date()) if pd.notna(data_min) and pd.notna(data_max) else None,
+            min_value=data_min.date() if pd.notna(data_min) else None,
+            max_value=data_max.date() if pd.notna(data_max) else None,
+        )
+    with f2:
+        vendedor_opts = ["(todos)"] + sorted(v for v in df_all["vendedor"].unique() if v)
+        filtro_vendedor_top = st.selectbox("Vendedor", vendedor_opts)
+    with f3:
+        coluna_opts = ["(todas)"] + sorted(df_all["coluna"].unique())
+        filtro_coluna_top = st.selectbox("Etapa", coluna_opts)
+    with f4:
+        origem_opts = ["(todas)"] + sorted(df_all["origem_atual"].unique())
+        filtro_origem_top = st.selectbox("Origem", origem_opts)
+
+df = df_all.copy()
 
 if isinstance(intervalo, tuple) and len(intervalo) == 2:
     inicio, fim = intervalo
-    mask = df_all["data_referencia"].dt.date.between(inicio, fim) | df_all["data_referencia"].isna()
-    df = df_all[mask].copy()
-else:
-    df = df_all.copy()
+    mask = df["data_referencia"].dt.date.between(inicio, fim) | df["data_referencia"].isna()
+    df = df[mask]
 
-st.caption(f"{len(df)} de {len(df_all)} conversas no período selecionado.")
+if filtro_vendedor_top != "(todos)":
+    df = df[df["vendedor"] == filtro_vendedor_top]
+if filtro_coluna_top != "(todas)":
+    df = df[df["coluna"] == filtro_coluna_top]
+if filtro_origem_top != "(todas)":
+    df = df[df["origem_atual"] == filtro_origem_top]
+
+df = df.copy()
+st.caption(f"{len(df)} de {len(df_all)} conversas com os filtros atuais.")
 
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Total de conversas", len(df))
@@ -314,13 +332,10 @@ with tab_gaps:
 
 with tab_dados:
     st.subheader("Explorar dados brutos")
-    vendedores_opts = ["(todos)"] + sorted(v for v in df["vendedor"].unique() if v)
-    filtro_vendedor = st.selectbox("Filtrar por vendedor", vendedores_opts)
+    st.caption("Já respeita os filtros de vendedor/etapa/origem lá em cima — aqui só busca por nome.")
     filtro_texto = st.text_input("Buscar por nome de contato")
 
     filtrado = df.copy()
-    if filtro_vendedor != "(todos)":
-        filtrado = filtrado[filtrado["vendedor"] == filtro_vendedor]
     if filtro_texto.strip():
         filtrado = filtrado[filtrado["contato"].str.contains(filtro_texto.strip(), case=False, na=False)]
 
