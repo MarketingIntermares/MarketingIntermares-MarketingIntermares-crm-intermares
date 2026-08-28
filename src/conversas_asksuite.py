@@ -30,6 +30,25 @@ ATRIBUIDO_RE = re.compile(r"[Aa]tendimento atribuíd[oa] (?:automaticamente )?pa
 ROBO_PARADO_RE = re.compile(r"O robô foi parado por ([^\n]+?) em (\d{2}/\d{2}/\d{4}) (\d{2}:\d{2})")
 RESOLVIDO_QUEM_RE = re.compile(r"([^\n]+?) marcou o atendimento como resolvido em (\d{2}/\d{2}/\d{4}) (\d{2}:\d{2})")
 ANTERIOR_COLAPSADO_RE = re.compile(r"Carregar o atendimento anterior realizado em (\d{2}/\d{2}/\d{4}) (\d{2}:\d{2})")
+MEMBRO_RE = re.compile(r"\bSOU\s+MEMBRO\b", re.IGNORECASE)
+
+# cada board tem um texto de empresa diferente separando o nome do contato do
+# resto das etiquetas do card -- sem isso, _extrair_nome_contato so funciona
+# pro board pra que foi escrito originalmente (Nauticomar).
+COMPANY_MARKER_BY_BOARD = {
+    "nauticomar": re.compile(r"Nauticomar Resort|Nauticomar\b"),
+    "intermares": re.compile(r"INTERMARES\b"),
+}
+
+# "ganhou" no Nauticomar e uma coluna do Kanban; o Intermares nao tem coluna
+# equivalente (pipeline de contato/follow-up, nao de negociacao) -- o sinal
+# real de conversao la e a etiqueta "SOU MEMBRO" no card (confirmado com o
+# usuario 2026-08-28). Mantem esta_na_coluna_ganhou como estava (especifico
+# do Nauticomar) e usa este dict pra um campo novo, board-agnostico.
+CONVERSION_RULES = {
+    "nauticomar": lambda coluna, card: coluna == "ganhou",
+    "intermares": lambda coluna, card: bool(MEMBRO_RE.search(card)),
+}
 
 
 def extract_timeline_events(conversation_text: str, card_raw_text: str = "") -> list[dict]:
@@ -190,14 +209,19 @@ def _to_iso_date(d: str) -> str | None:
     return f"{yy}-{mm}-{dd}"
 
 
-def _extrair_nome_contato(card_raw_text: str) -> str:
+def _extrair_nome_contato(card_raw_text: str, board: str = "") -> str:
     texto = re.sub(r"^(chat_bubble(_outline)?|check_circle_outline)\s*", "", card_raw_text)
     texto = re.sub(
         r"^(ABERTO|RESOLVIDO)?\s*(schedule(\d+[hms]\s*)+)?\s*(\d{1,2}(:\d{2}|/\d{2}/\d{2}))?\s*",
         "", texto,
     )
     texto = re.sub(r"^\d+\s+", "", texto)
-    m = re.search(r"(Nauticomar Resort|Nauticomar\b)", texto)
+    marcador = COMPANY_MARKER_BY_BOARD.get(board)
+    m = marcador.search(texto) if marcador else None
+    if not m:
+        # fallback generico pra um board sem marcador cadastrado: nome da
+        # empresa nesses cards sempre aparece em CAIXA ALTA com 3+ palavras.
+        m = re.search(r"\b[A-ZÀ-Ú]{2,}(?:\s+[A-ZÀ-Úa-z]{2,}){2,}", texto)
     nome = texto[: m.start()].strip() if m else texto[:40].strip()
     return nome or "(sem nome)"
 
@@ -237,6 +261,7 @@ class ConversaParsed:
     tem_etiqueta_perdeu: bool
     motivo_perda: str
     esta_na_coluna_ganhou: bool
+    converteu: bool
     data_resolucao: str | None
     tamanho_conversa_chars: int
     atendimentos_anteriores_expandidos: int
@@ -248,6 +273,7 @@ class ConversaParsed:
 def parse_record(r: dict) -> ConversaParsed:
     card = r.get("card_raw_text", "") or ""
     text = r.get("conversation_text", "") or ""
+    board = r.get("board", "") or ""
 
     m_att = ATT_RE.search(card)
     vendedor = m_att.group(1).strip().upper() if m_att else ""
@@ -283,12 +309,15 @@ def parse_record(r: dict) -> ConversaParsed:
     m_resolvido = RESOLVIDO_RE.findall(text)  # 2 grupos (data, hora) -> findall devolve tuplas
     data_resolucao = _to_iso_date(m_resolvido[0][0]) if m_resolvido else None
 
+    regra_conversao = CONVERSION_RULES.get(board)
+    converteu = bool(regra_conversao(r.get("coluna"), card)) if regra_conversao else False
+
     return ConversaParsed(
         card_key=r.get("_card_key", ""),
-        board=r.get("board", ""),
+        board=board,
         status_filtro=r.get("status_filtro", ""),
         coluna=r.get("coluna", ""),
-        contato=_extrair_nome_contato(card),
+        contato=_extrair_nome_contato(card, board),
         vendedor=vendedor,
         tag_ori_original=tag_ori,
         tag_cam_original=tag_cam,
@@ -300,6 +329,7 @@ def parse_record(r: dict) -> ConversaParsed:
         tem_etiqueta_perdeu=tem_perdeu,
         motivo_perda=motivo_perda,
         esta_na_coluna_ganhou=(r.get("coluna") == "ganhou"),
+        converteu=converteu,
         data_resolucao=data_resolucao,
         tamanho_conversa_chars=len(text),
         atendimentos_anteriores_expandidos=r.get("atendimentos_anteriores_expandidos", 0) or 0,
@@ -329,6 +359,7 @@ def init_schema() -> None:
             tem_etiqueta_perdeu BOOLEAN NOT NULL DEFAULT FALSE,
             motivo_perda TEXT,
             esta_na_coluna_ganhou BOOLEAN NOT NULL DEFAULT FALSE,
+            converteu BOOLEAN NOT NULL DEFAULT FALSE,
             data_resolucao DATE,
             tamanho_conversa_chars INTEGER NOT NULL DEFAULT 0,
             atendimentos_anteriores_expandidos INTEGER NOT NULL DEFAULT 0,
@@ -339,6 +370,10 @@ def init_schema() -> None:
         )""",
         fetch=None,
     )
+    # migracao pra quem ja tinha a tabela criada antes do campo converteu
+    # existir (CREATE TABLE IF NOT EXISTS acima nao adiciona coluna em tabela
+    # existente).
+    db_query(f"ALTER TABLE {CONVERSAS_TABLE} ADD COLUMN IF NOT EXISTS converteu BOOLEAN NOT NULL DEFAULT FALSE", fetch=None)
     db_query(f"CREATE INDEX IF NOT EXISTS idx_{CONVERSAS_TABLE}_vendedor ON {CONVERSAS_TABLE}(vendedor)", fetch=None)
     db_query(f"CREATE INDEX IF NOT EXISTS idx_{CONVERSAS_TABLE}_coluna ON {CONVERSAS_TABLE}(coluna)", fetch=None)
     db_query(f"CREATE INDEX IF NOT EXISTS idx_{CONVERSAS_TABLE}_origem_atual ON {CONVERSAS_TABLE}(origem_atual)", fetch=None)
@@ -349,14 +384,14 @@ INSERT INTO {CONVERSAS_TABLE} (
     card_key, board, status_filtro, coluna, contato, vendedor,
     tag_ori_original, tag_cam_original, origem_atual, origem_primeira_vez,
     data_primeira_vez, mudou_de_canal, qtd_atendimentos_historico,
-    tem_etiqueta_perdeu, motivo_perda, esta_na_coluna_ganhou, data_resolucao,
+    tem_etiqueta_perdeu, motivo_perda, esta_na_coluna_ganhou, converteu, data_resolucao,
     tamanho_conversa_chars, atendimentos_anteriores_expandidos,
     card_raw_text, conversation_text, extraido_em
 ) VALUES (
     %(card_key)s, %(board)s, %(status_filtro)s, %(coluna)s, %(contato)s, %(vendedor)s,
     %(tag_ori_original)s, %(tag_cam_original)s, %(origem_atual)s, %(origem_primeira_vez)s,
     %(data_primeira_vez)s, %(mudou_de_canal)s, %(qtd_atendimentos_historico)s,
-    %(tem_etiqueta_perdeu)s, %(motivo_perda)s, %(esta_na_coluna_ganhou)s, %(data_resolucao)s,
+    %(tem_etiqueta_perdeu)s, %(motivo_perda)s, %(esta_na_coluna_ganhou)s, %(converteu)s, %(data_resolucao)s,
     %(tamanho_conversa_chars)s, %(atendimentos_anteriores_expandidos)s,
     %(card_raw_text)s, %(conversation_text)s, %(extraido_em)s
 )
@@ -368,6 +403,7 @@ ON CONFLICT (card_key) DO UPDATE SET
     tem_etiqueta_perdeu = EXCLUDED.tem_etiqueta_perdeu,
     motivo_perda = EXCLUDED.motivo_perda,
     esta_na_coluna_ganhou = EXCLUDED.esta_na_coluna_ganhou,
+    converteu = EXCLUDED.converteu,
     data_resolucao = EXCLUDED.data_resolucao,
     conversation_text = EXCLUDED.conversation_text,
     carregado_em = NOW()
